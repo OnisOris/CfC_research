@@ -1,0 +1,23 @@
+[project]
+name = "cfc-video-demo"
+version = "0.1.0"
+description = "Small CfC webcam motion-object localization demo."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "ncps",
+    "numpy",
+    "opencv-python",
+    "torch",
+    "tqdm",
+]
+
+[project.scripts]
+cfc-motion-detector = "cfc_video_demo.cfc_motion_detector:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true

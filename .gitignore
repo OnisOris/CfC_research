@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local/generated project artifacts
+.tmp/
+tmp/
+logs/
+runs/
+outputs/
+
+# Datasets, labels, frame exports, and media
+data/
+datasets/
+dataset/
+images/
+frames/
+labels/
+annotations/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.npz
+*.npy
+*.csv
+
+# Model checkpoints and exported weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
