@@ -1,4 +1,6 @@
 import argparse
+import configparser
+import csv
 import pickle
 import shutil
 import subprocess
@@ -88,6 +90,184 @@ def load_labels(path, expected_len):
         )
 
     return labels_obj, labels_box
+
+
+def read_seqinfo(seq_dir):
+    seqinfo = seq_dir / "seqinfo.ini"
+    if not seqinfo.exists():
+        return {}
+
+    parser = configparser.ConfigParser()
+    parser.read(seqinfo)
+    if "Sequence" not in parser:
+        return {}
+
+    section = parser["Sequence"]
+    return {
+        "fps": section.getfloat("frameRate", fallback=30.0),
+        "length": section.getint("seqLength", fallback=0),
+        "ext": section.get("imExt", fallback=".jpg"),
+    }
+
+
+def mot_row_is_person(parts, include_static=False):
+    if len(parts) < 7:
+        return False
+
+    active = float(parts[6]) != 0.0
+    if not active:
+        return False
+
+    # MOT tracking ground truth often stores class and visibility in columns
+    # 8 and 9. MOT17Det detection rows may only have 7 columns, so keep them.
+    if len(parts) >= 9:
+        class_id = int(float(parts[7]))
+        person_classes = {1, 2}
+        if include_static:
+            person_classes.add(7)
+        if class_id not in person_classes:
+            return False
+
+    return True
+
+
+def load_mot_frame_boxes(gt_path, min_visibility=0.0, include_static=False):
+    boxes_by_frame = {}
+    with gt_path.open(newline="") as f:
+        reader = csv.reader(f)
+        for parts in reader:
+            if not parts or not mot_row_is_person(parts, include_static=include_static):
+                continue
+
+            if len(parts) >= 9:
+                visibility = float(parts[8])
+                if visibility < min_visibility:
+                    continue
+
+            frame_id = int(float(parts[0]))
+            left = float(parts[2])
+            top = float(parts[3])
+            width = float(parts[4])
+            height = float(parts[5])
+            if width <= 1 or height <= 1:
+                continue
+
+            boxes_by_frame.setdefault(frame_id, []).append((left, top, width, height))
+
+    return boxes_by_frame
+
+
+def mot_boxes_to_label(boxes, src_w, src_h, mode):
+    if not boxes:
+        return 0.0, np.array([0, 0, 0, 0], dtype=np.float32)
+
+    if mode == "largest":
+        left, top, width, height = max(boxes, key=lambda b: b[2] * b[3])
+        x1, y1, x2, y2 = left, top, left + width, top + height
+    elif mode == "union":
+        x1 = min(box[0] for box in boxes)
+        y1 = min(box[1] for box in boxes)
+        x2 = max(box[0] + box[2] for box in boxes)
+        y2 = max(box[1] + box[3] for box in boxes)
+    else:
+        raise ValueError(f"Unknown box mode: {mode}")
+
+    x1 = np.clip(x1, 0, src_w)
+    y1 = np.clip(y1, 0, src_h)
+    x2 = np.clip(x2, 0, src_w)
+    y2 = np.clip(y2, 0, src_h)
+
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return 0.0, np.array([0, 0, 0, 0], dtype=np.float32)
+
+    box = np.array(
+        [
+            ((x1 + x2) / 2) / src_w,
+            ((y1 + y2) / 2) / src_h,
+            (x2 - x1) / src_w,
+            (y2 - y1) / src_h,
+        ],
+        dtype=np.float32,
+    )
+    return 1.0, box
+
+
+def first_present(row, names):
+    for name in names:
+        if name in row and row[name] != "":
+            return row[name]
+    return None
+
+
+def load_frame_csv_boxes(path):
+    boxes = []
+    with Path(path).open(newline="") as f:
+        sample = f.read(2048)
+        f.seek(0)
+        try:
+            has_header = csv.Sniffer().has_header(sample)
+        except csv.Error:
+            has_header = True
+
+        if has_header:
+            reader = csv.DictReader(f)
+            for row in reader:
+                x = first_present(row, ("x", "xmin", "left", "bb_left"))
+                y = first_present(row, ("y", "ymin", "top", "bb_top"))
+                w = first_present(row, ("w", "width", "bb_width"))
+                h = first_present(row, ("h", "height", "bb_height"))
+                xmax = first_present(row, ("xmax", "right"))
+                ymax = first_present(row, ("ymax", "bottom"))
+
+                if x is None or y is None:
+                    boxes.append(None)
+                    continue
+
+                x = float(x)
+                y = float(y)
+                if w is not None and h is not None:
+                    w = float(w)
+                    h = float(h)
+                elif xmax is not None and ymax is not None:
+                    w = float(xmax) - x
+                    h = float(ymax) - y
+                else:
+                    boxes.append(None)
+                    continue
+
+                boxes.append((x, y, w, h) if w > 1 and h > 1 else None)
+        else:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 4:
+                    boxes.append(None)
+                    continue
+                x, y, w, h = [float(v) for v in row[:4]]
+                boxes.append((x, y, w, h) if w > 1 and h > 1 else None)
+
+    return boxes
+
+
+def csv_box_to_label(box, src_w, src_h):
+    if box is None:
+        return 0.0, np.array([0, 0, 0, 0], dtype=np.float32)
+    return mot_boxes_to_label([box], src_w=src_w, src_h=src_h, mode="largest")
+
+
+def resolve_video_path(path):
+    path = Path(path)
+    if path.exists():
+        return path
+
+    if path.suffix:
+        return path
+
+    for suffix in (".mp4", ".avi", ".mov", ".mkv"):
+        candidate = path.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+
+    return path
 
 
 def box_to_rect(box):
@@ -477,6 +657,173 @@ def export_frames(args):
     print(f"Frames: {saved}/{len(frames)}")
 
 
+def prepare_mot(args):
+    seq_dir = Path(args.seq)
+    img_dir = seq_dir / "img1"
+    gt_path = seq_dir / "gt" / "gt.txt"
+
+    if not img_dir.exists():
+        raise FileNotFoundError(f"Missing MOT image directory: {img_dir}")
+    if not gt_path.exists():
+        raise FileNotFoundError(f"Missing MOT ground-truth file: {gt_path}")
+
+    seqinfo = read_seqinfo(seq_dir)
+    fps = args.fps or seqinfo.get("fps", 30.0)
+    ext = args.ext or seqinfo.get("ext", ".jpg")
+
+    frame_paths = sorted(img_dir.glob(f"*{ext}"))
+    if args.max_frames:
+        frame_paths = frame_paths[: args.max_frames]
+    if not frame_paths:
+        raise RuntimeError(f"No frames matching *{ext} in {img_dir}")
+
+    boxes_by_frame = load_mot_frame_boxes(
+        gt_path,
+        min_visibility=args.min_visibility,
+        include_static=args.include_static,
+    )
+
+    frames = []
+    times = []
+    labels_obj = []
+    labels_box = []
+
+    src_w = None
+    src_h = None
+    for i, frame_path in enumerate(tqdm(frame_paths, desc="prepare MOT")):
+        frame_bgr = cv2.imread(str(frame_path))
+        if frame_bgr is None:
+            raise RuntimeError(f"Could not read frame: {frame_path}")
+
+        if src_w is None or src_h is None:
+            src_h, src_w = frame_bgr.shape[:2]
+
+        frame_id = int(frame_path.stem)
+        obj, box = mot_boxes_to_label(
+            boxes_by_frame.get(frame_id, []),
+            src_w=src_w,
+            src_h=src_h,
+            mode=args.box_mode,
+        )
+
+        frames.append(resize_rgb(frame_bgr))
+        times.append(i / fps)
+        labels_obj.append(obj)
+        labels_box.append(box)
+
+    out_data = Path(args.out_data)
+    out_labels = Path(args.out_labels)
+    out_data.parent.mkdir(parents=True, exist_ok=True)
+    out_labels.parent.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        out_data,
+        frames=np.array(frames, dtype=np.uint8),
+        times=np.array(times, dtype=np.float32),
+        source_mot_sequence=str(seq_dir),
+        fps=np.array(fps, dtype=np.float32),
+    )
+    np.savez_compressed(
+        out_labels,
+        labels_obj=np.array(labels_obj, dtype=np.float32),
+        labels_box=np.array(labels_box, dtype=np.float32),
+        source_data=str(out_data),
+        source_mot_sequence=str(seq_dir),
+        box_mode=args.box_mode,
+    )
+
+    positives = int(np.sum(labels_obj))
+    print(f"Saved data: {out_data}")
+    print(f"Saved labels: {out_labels}")
+    print(f"Frames: {len(frames)}")
+    print(f"Positive frames: {positives}/{len(frames)} ({positives / len(frames):.1%})")
+    print(f"Box mode: {args.box_mode}")
+
+
+def prepare_video_csv(args):
+    video_path = resolve_video_path(args.video)
+    csv_path = Path(args.csv)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Missing video: {video_path}")
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Missing CSV labels: {csv_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    fps = args.fps or cap.get(cv2.CAP_PROP_FPS) or 30.0
+    labels = load_frame_csv_boxes(csv_path)
+
+    frames = []
+    times = []
+    labels_obj = []
+    labels_box = []
+
+    frame_idx = 0
+    saved_idx = 0
+    pbar = tqdm(desc="prepare video CSV")
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+
+        if args.max_frames and frame_idx >= args.max_frames:
+            break
+
+        if frame_idx % args.every == 0:
+            src_h, src_w = frame_bgr.shape[:2]
+            obj, box = csv_box_to_label(
+                labels[frame_idx] if frame_idx < len(labels) else None,
+                src_w=src_w,
+                src_h=src_h,
+            )
+
+            frames.append(resize_rgb(frame_bgr))
+            times.append(frame_idx / fps)
+            labels_obj.append(obj)
+            labels_box.append(box)
+            saved_idx += 1
+
+        frame_idx += 1
+        pbar.update(1)
+
+    pbar.close()
+    cap.release()
+
+    if not frames:
+        raise RuntimeError(f"No frames read from video: {video_path}")
+
+    out_data = Path(args.out_data)
+    out_labels = Path(args.out_labels)
+    out_data.parent.mkdir(parents=True, exist_ok=True)
+    out_labels.parent.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        out_data,
+        frames=np.array(frames, dtype=np.uint8),
+        times=np.array(times, dtype=np.float32),
+        source_video=str(video_path),
+        source_csv=str(csv_path),
+        fps=np.array(fps, dtype=np.float32),
+    )
+    np.savez_compressed(
+        out_labels,
+        labels_obj=np.array(labels_obj, dtype=np.float32),
+        labels_box=np.array(labels_box, dtype=np.float32),
+        source_data=str(out_data),
+        source_video=str(video_path),
+        source_csv=str(csv_path),
+    )
+
+    positives = int(np.sum(labels_obj))
+    print(f"Saved data: {out_data}")
+    print(f"Saved labels: {out_labels}")
+    print(f"Read video frames: {frame_idx}")
+    print(f"Saved frames: {saved_idx}")
+    print(f"Positive frames: {positives}/{len(frames)} ({positives / len(frames):.1%})")
+
+
 def print_label_stats(ds):
     obj = ds.labels_obj
     boxes = ds.labels_box[obj > 0]
@@ -626,15 +973,46 @@ def demo(args):
         ) from exc
     model.eval()
 
-    bg = ckpt["background"]
-    if isinstance(bg, torch.Tensor):
-        bg = bg.cpu().numpy()
     seq_len = ckpt["seq_len"]
 
     cap = cv2.VideoCapture(args.cam)
 
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index={args.cam}")
+
+    if args.live_bg_frames > 0:
+        print(
+            f"Calibrating live background from {args.live_bg_frames} frames. "
+            "Keep the target area empty/still."
+        )
+        bg_frames = []
+        while len(bg_frames) < args.live_bg_frames:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                continue
+
+            bg_frames.append(resize_rgb(frame_bgr))
+            frame_show = cv2.resize(frame_bgr, (W * 4, H * 4))
+            cv2.putText(
+                frame_show,
+                f"Calibrating background {len(bg_frames)}/{args.live_bg_frames}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 255),
+                2,
+            )
+            cv2.imshow("CfC moving object detector", frame_show)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+
+        bg = make_background(np.array(bg_frames, dtype=np.uint8), bg_frames=len(bg_frames))
+    else:
+        bg = ckpt["background"]
+        if isinstance(bg, torch.Tensor):
+            bg = bg.cpu().numpy()
 
     buf = deque(maxlen=seq_len)
     time_buf = deque(maxlen=seq_len)
@@ -987,6 +1365,28 @@ def main():
     p.add_argument("--height", type=int, default=384)
     p.set_defaults(func=export_frames)
 
+    p = sub.add_parser("prepare-mot")
+    p.add_argument("--seq", type=str, required=True)
+    p.add_argument("--out-data", type=str, default="data/mot17_person_seq.npz")
+    p.add_argument("--out-labels", type=str, default="data/mot17_person_labels.npz")
+    p.add_argument("--fps", type=float, default=0.0)
+    p.add_argument("--ext", type=str, default=None)
+    p.add_argument("--box-mode", choices=("largest", "union"), default="largest")
+    p.add_argument("--min-visibility", type=float, default=0.2)
+    p.add_argument("--include-static", action="store_true")
+    p.add_argument("--max-frames", type=int, default=0)
+    p.set_defaults(func=prepare_mot)
+
+    p = sub.add_parser("prepare-video-csv")
+    p.add_argument("--video", type=str, required=True)
+    p.add_argument("--csv", type=str, required=True)
+    p.add_argument("--out-data", type=str, default="data/pedestrian_video_seq.npz")
+    p.add_argument("--out-labels", type=str, default="data/pedestrian_video_labels.npz")
+    p.add_argument("--fps", type=float, default=0.0)
+    p.add_argument("--every", type=int, default=1)
+    p.add_argument("--max-frames", type=int, default=0)
+    p.set_defaults(func=prepare_video_csv)
+
     p = sub.add_parser("train")
     p.add_argument("--data", type=str, default="data/webcam_motion.npz")
     p.add_argument("--labels", type=str, default=None)
@@ -1037,6 +1437,7 @@ def main():
     p.add_argument("--show-teacher", action="store_true")
     p.add_argument("--diff-th", type=int, default=35)
     p.add_argument("--min-area", type=int, default=40)
+    p.add_argument("--live-bg-frames", type=int, default=60)
     p.add_argument("--cpu", action="store_true")
     p.set_defaults(func=demo)
 

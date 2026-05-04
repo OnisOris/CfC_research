@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 cfc-motion-detector = "cfc_video_demo.cfc_motion_detector:main"
+cfc-aerial-detector = "cfc_video_demo.cfc_aerial_detector:main"
 
 [build-system]
 requires = ["hatchling"]
