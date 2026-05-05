@@ -1,2 +1,1 @@
-"""CfC webcam motion-object localization demo."""
-
+"""CNN + CfC video pedestrian localization demo."""

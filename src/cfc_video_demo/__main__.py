@@ -1,4 +1,11 @@
-from cfc_video_demo.cfc_motion_detector import main
+def main() -> None:
+    print(
+        "Use one of the Caltech CfC commands:\n"
+        "  cfc-caltech-convert\n"
+        "  cfc-caltech-train\n"
+        "  cfc-caltech-eval\n"
+        "  cfc-caltech-predict"
+    )
 
 
 if __name__ == "__main__":

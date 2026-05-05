@@ -30,6 +30,10 @@ images/
 frames/
 labels/
 annotations/
+!src/cfc_video_demo/datasets/
+!src/cfc_video_demo/datasets/**
+src/cfc_video_demo/datasets/__pycache__/
+src/cfc_video_demo/datasets/**/*.pyc
 *.jpg
 *.jpeg
 *.png

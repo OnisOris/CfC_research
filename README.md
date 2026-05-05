@@ -1,137 +1,146 @@
 # CfC research
 
-## CfC aerial SAR person detection
+Small research demo for pedestrian localization in video with Closed-form
+Continuous-time networks.
 
-I did not find a public downloadable LisaAlert/Beeline AI dataset. Public
-articles describe an internal dataset collected from real search missions, but
-do not provide an open download link.
+This is not YOLO. The model in this repository is:
 
-For an open annotated search-and-rescue substitute, use SARD:
-https://www.kaggle.com/datasets/nikolasgegenava/sard-search-and-rescue
-
-It is already annotated with one class, `human`, and contains drone/SAR imagery.
-The labels are stored in YOLO text format, but the training below uses the
-repository's CfC-based aerial detector, not YOLO.
-Download and unpack:
-
-```bash
-mkdir -p ~/Downloads data/sard
-
-curl -L -o ~/Downloads/sard-search-and-rescue.zip \
-  https://www.kaggle.com/api/v1/datasets/download/nikolasgegenava/sard-search-and-rescue
-
-unzip -o ~/Downloads/sard-search-and-rescue.zip -d data/sard
+```text
+RGB frame sequence -> CNN encoder per frame -> CfC over time -> detection head
 ```
 
-Use a local dataset file because the exported Roboflow `data.yaml` has
-paths that do not match this repository layout:
+The detector predicts one target for the last frame of each sequence:
 
-```yaml
-path: /home/onis/code/CfC_research/data/sard/search-and-rescue
-train: train/images
-val: valid/images
-test: test/images
+- `objectness`: whether a person is present
+- `bbox`: normalized `cx cy w h`
 
-names:
-  0: human
-```
+For the first Caltech demo this is intentionally a single-target detector, not
+a full multi-object detector. If a frame has multiple people, conversion uses
+either the largest person box or the union of all person boxes.
 
-Train the CfC aerial prototype:
+## Caltech Pedestrian Pipeline
 
-```bash
-uv run cfc-aerial-detector train \
-  --data data/sard/sard.yaml \
-  --model cfc_aerial_sard.pt \
-  --image-size 640 \
-  --seq-len 1 \
-  --epochs 20 \
-  --batch 8 \
-  --workers 4
-```
-
-Run it on the SARD test split:
-
-```bash
-uv run cfc-aerial-detector predict \
-  --model cfc_aerial_sard.pt \
-  --source data/sard/search-and-rescue/test/images \
-  --out outputs/cfc_aerial_sard_test \
-  --th 0.5
-```
-
-The current CfC aerial detector is a research prototype: it predicts whether a
-tile contains a person and emits one box per tile. When an image has multiple
-people, labels are reduced to either a union box or the largest box. For true
-high-resolution aerial video, split frames into overlapping tiles first, then
-train/evaluate on tile sequences. The SARD export is already a 640x640
-tiled/preprocessed dataset.
-
-## Ready pedestrian datasets
-
-The MOT17Det page is not reliable for downloading. For quick local CfC
-experiments, use the small Kaggle Pedestrian Dataset instead:
-https://www.kaggle.com/datasets/smeschke/pedestrian-dataset
-
-It contains three pedestrian videos and CSV bounding boxes. The dataset page
-lists it as CC0/Public Domain, so it is convenient for experiments.
-
-Download it, then convert one video/CSV pair into this project's `.npz` format:
-
-```bash
-mkdir -p ~/Downloads data/pedestrian_kaggle
-
-curl -L -o ~/Downloads/pedestrian-dataset.zip \
-  https://www.kaggle.com/api/v1/datasets/download/smeschke/pedestrian-dataset
-
-unzip -o ~/Downloads/pedestrian-dataset.zip -d data/pedestrian_kaggle
-
-uv run cfc-motion-detector prepare-video-csv \
-  --video data/pedestrian_kaggle/crosswalk \
-  --csv data/pedestrian_kaggle/crosswalk.csv \
-  --out-data data/crosswalk_person_seq.npz \
-  --out-labels data/crosswalk_person_labels.npz
-```
-
-Then train with the converted labels:
-
-```bash
-uv run cfc-motion-detector train \
-  --data data/crosswalk_person_seq.npz \
-  --labels data/crosswalk_person_labels.npz \
-  --model cfc_crosswalk_person.pt
-```
-
-Run the webcam demo. Keep the target area empty/still for the first couple of
-seconds while it calibrates the live background:
-
-```bash
-uv run cfc-motion-detector demo \
-  --model cfc_crosswalk_person.pt \
-  --cam 0 \
-  --th 0.5
-```
-
-This is only a quick pipeline check. The Kaggle videos have a pedestrian in
-every frame, so the model does not learn a useful "no person" state and will
-not generalize well to a close indoor webcam view. For a real webcam demo,
-collect and annotate local camera data:
-
-```bash
-uv run cfc-motion-detector collect --seconds 60 --out data/webcam_room.npz
-
-uv run cfc-motion-detector annotate \
-  --data data/webcam_room.npz \
-  --out data/webcam_room_labels.npz \
-  --init-auto
-
-uv run cfc-motion-detector train \
-  --data data/webcam_room.npz \
-  --labels data/webcam_room_labels.npz \
-  --model cfc_webcam_room.pt
-```
-
-For a larger research dataset, use Caltech Pedestrians from CaltechDATA:
+The primary dataset target is Caltech Pedestrians:
 https://data.caltech.edu/records/f6rph-90m20
 
-Caltech is much larger and also has pedestrian bounding-box annotations, but it
-needs an additional Caltech annotation converter before training here.
+The dbcollection dataset page is useful for understanding the available
+Caltech detection tasks and the original annotations:
+https://dbcollection.readthedocs.io/en/latest/datasets/caltech_ped.html
+
+### Download
+
+```bash
+mkdir -p data/caltech_pedestrians
+
+curl -L -C - \
+  -o data/caltech_pedestrians/data_and_labels.zip \
+  "https://data.caltech.edu/records/f6rph-90m20/files/data_and_labels.zip?download=1"
+```
+
+### Unzip
+
+```bash
+unzip data/caltech_pedestrians/data_and_labels.zip -d data/caltech_pedestrians/raw
+```
+
+If the unzip creates `setXX.tar` files instead of extracted `setXX/*.seq`
+directories, either unpack those tars manually or pass `--extract-tars` to the
+converter.
+
+### Convert
+
+```bash
+uv run cfc-caltech-convert \
+  --raw-root data/caltech_pedestrians/raw \
+  --out data/caltech_prepared \
+  --image-size 128 \
+  --frame-step 3 \
+  --target-mode largest
+```
+
+Prepared data is written as one `.npz` per source video:
+
+```text
+data/caltech_prepared/
+  train/
+    set00_V000.npz
+  val/
+  test/
+  manifest_train.jsonl
+  manifest_val.jsonl
+  manifest_test.jsonl
+```
+
+Each `.npz` contains resized RGB frames, frame times, objectness labels, and a
+single normalized target box for each frame.
+
+### Train
+
+```bash
+uv run cfc-caltech-train \
+  --data data/caltech_prepared \
+  --model outputs/cfc_caltech.pt \
+  --seq-len 16 \
+  --stride 4 \
+  --epochs 20 \
+  --batch 32
+```
+
+`seq_len` defaults to `16`; use at least `8` for meaningful temporal CfC
+experiments.
+
+### Eval
+
+```bash
+uv run cfc-caltech-eval \
+  --data data/caltech_prepared \
+  --model outputs/cfc_caltech.pt \
+  --split val
+```
+
+The first demo reports precision, recall, F1, mean IoU on positive frames, and
+recall at IoU 0.5. It does not compute mAP.
+
+### Predict
+
+```bash
+uv run cfc-caltech-predict \
+  --model outputs/cfc_caltech.pt \
+  --source data/caltech_prepared/val/<some_sequence>.npz \
+  --out outputs/cfc_caltech_demo.mp4
+```
+
+The visualization draws predicted boxes in red and ground-truth boxes in green.
+
+## Smoke Test
+
+After a small part of the dataset is available, use:
+
+```bash
+uv run cfc-caltech-convert \
+  --raw-root data/caltech_pedestrians/raw \
+  --out data/caltech_prepared_smoke \
+  --image-size 128 \
+  --frame-step 10 \
+  --max-sequences 2
+
+uv run cfc-caltech-train \
+  --data data/caltech_prepared_smoke \
+  --model outputs/cfc_caltech_smoke.pt \
+  --seq-len 8 \
+  --stride 2 \
+  --epochs 1 \
+  --batch 4 \
+  --max-train-windows 128 \
+  --max-val-windows 64
+
+uv run cfc-caltech-eval \
+  --data data/caltech_prepared_smoke \
+  --model outputs/cfc_caltech_smoke.pt \
+  --split val
+
+uv run cfc-caltech-predict \
+  --model outputs/cfc_caltech_smoke.pt \
+  --source data/caltech_prepared_smoke/val/<some_sequence>.npz \
+  --out outputs/cfc_caltech_smoke.mp4
+```

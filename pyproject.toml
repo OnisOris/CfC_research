@@ -1,20 +1,23 @@
 [project]
 name = "cfc-video-demo"
 version = "0.1.0"
-description = "Small CfC webcam motion-object localization demo."
+description = "Small CNN+CfC video pedestrian localization demo."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
     "ncps",
     "numpy",
     "opencv-python",
+    "scipy",
     "torch",
     "tqdm",
 ]
 
 [project.scripts]
-cfc-motion-detector = "cfc_video_demo.cfc_motion_detector:main"
-cfc-aerial-detector = "cfc_video_demo.cfc_aerial_detector:main"
+cfc-caltech-convert = "cfc_video_demo.cli:caltech_convert_main"
+cfc-caltech-train = "cfc_video_demo.cli:caltech_train_main"
+cfc-caltech-eval = "cfc_video_demo.cli:caltech_eval_main"
+cfc-caltech-predict = "cfc_video_demo.cli:caltech_predict_main"
 
 [build-system]
 requires = ["hatchling"]
