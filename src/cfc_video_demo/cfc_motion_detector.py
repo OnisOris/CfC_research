@@ -824,6 +824,87 @@ def prepare_video_csv(args):
     print(f"Positive frames: {positives}/{len(frames)} ({positives / len(frames):.1%})")
 
 
+def append_dataset(args):
+    parts = [
+        (Path(args.base_data), Path(args.base_labels)),
+        (Path(args.add_data), Path(args.add_labels)),
+    ]
+
+    frame_parts = []
+    time_parts = []
+    obj_parts = []
+    box_parts = []
+    sources = []
+    time_cursor = 0.0
+
+    for data_path, labels_path in parts:
+        if not data_path.exists():
+            raise FileNotFoundError(f"Missing data: {data_path}")
+        if not labels_path.exists():
+            raise FileNotFoundError(f"Missing labels: {labels_path}")
+
+        data = np.load(data_path)
+        labels = np.load(labels_path)
+        frames = data["frames"].astype(np.uint8)
+        times = data["times"].astype(np.float32)
+        labels_obj = labels["labels_obj"].astype(np.float32)
+        labels_box = labels["labels_box"].astype(np.float32)
+
+        if len(frames) != len(times):
+            raise ValueError(f"Frame/time mismatch in {data_path}: {len(frames)} != {len(times)}")
+        if len(labels_obj) != len(frames) or len(labels_box) != len(frames):
+            raise ValueError(
+                f"Label/frame mismatch for {data_path}: "
+                f"frames={len(frames)}, obj={len(labels_obj)}, box={len(labels_box)}"
+            )
+
+        if len(times) > 1:
+            dts = np.diff(times)
+            dts = dts[dts > 1e-4]
+            local_dt = float(np.median(dts)) if len(dts) else 1.0 / 30.0
+        else:
+            local_dt = 1.0 / 30.0
+
+        shifted_times = times - times[0] + time_cursor
+        time_cursor = float(shifted_times[-1] + local_dt)
+
+        frame_parts.append(frames)
+        time_parts.append(shifted_times.astype(np.float32))
+        obj_parts.append(labels_obj)
+        box_parts.append(labels_box)
+        sources.append(f"{data_path}:{labels_path}")
+
+    out_data = Path(args.out_data)
+    out_labels = Path(args.out_labels)
+    out_data.parent.mkdir(parents=True, exist_ok=True)
+    out_labels.parent.mkdir(parents=True, exist_ok=True)
+
+    frames = np.concatenate(frame_parts).astype(np.uint8)
+    times = np.concatenate(time_parts).astype(np.float32)
+    labels_obj = np.concatenate(obj_parts).astype(np.float32)
+    labels_box = np.concatenate(box_parts).astype(np.float32)
+
+    np.savez_compressed(
+        out_data,
+        frames=frames,
+        times=times,
+        sources=np.array(sources),
+    )
+    np.savez_compressed(
+        out_labels,
+        labels_obj=labels_obj,
+        labels_box=labels_box,
+        source_data=str(out_data),
+        sources=np.array(sources),
+    )
+
+    positives = int(labels_obj.sum())
+    print(f"Saved data: {out_data}")
+    print(f"Saved labels: {out_labels}")
+    print(f"Frames: {len(frames)}")
+    print(f"Positive frames: {positives}/{len(frames)} ({positives / len(frames):.1%})")
+
+
 def print_label_stats(ds):
     obj = ds.labels_obj
     boxes = ds.labels_box[obj > 0]
@@ -1016,8 +1097,16 @@ def demo(args):
 
     buf = deque(maxlen=seq_len)
     time_buf = deque(maxlen=seq_len)
+    record_frames = []
+    record_times = []
+    record_prob = []
+    record_box = []
+    record_teacher_obj = []
+    record_teacher_box = []
 
     print("Move an object in front of the camera. Press q to exit.")
+    if args.record_out:
+        print(f"Recording feedback session to: {args.record_out}")
 
     t0 = time.time()
 
@@ -1035,6 +1124,29 @@ def demo(args):
         time_buf.append(now)
 
         frame_show = cv2.resize(frame_bgr, (W * 4, H * 4))
+        prob = np.nan
+        pred_box = np.zeros(4, dtype=np.float32)
+        teacher_obj = 0.0
+        teacher_box = np.zeros(4, dtype=np.float32)
+
+        if args.show_teacher or args.record_out:
+            teacher_obj, teacher_box, _mask = label_from_diff(
+                diff, threshold=args.diff_th, min_area=args.min_area
+            )
+            if args.show_teacher and teacher_obj > 0:
+                tcx, tcy, tbw, tbh = teacher_box
+                tx1 = int((tcx - tbw / 2) * W)
+                ty1 = int((tcy - tbh / 2) * H)
+                tx2 = int((tcx + tbw / 2) * W)
+                ty2 = int((tcy + tbh / 2) * H)
+                scale = 4
+                cv2.rectangle(
+                    frame_show,
+                    (tx1 * scale, ty1 * scale),
+                    (tx2 * scale, ty2 * scale),
+                    (0, 255, 0),
+                    1,
+                )
 
         if len(buf) == seq_len:
             x = np.array(buf, dtype=np.float32) / 255.0
@@ -1050,7 +1162,8 @@ def demo(args):
 
             obj_logit, box = model(x, dt)
             prob = torch.sigmoid(obj_logit)[0].item()
-            cx, cy, bw, bh = box[0].cpu().numpy()
+            pred_box = box[0].cpu().numpy().astype(np.float32)
+            cx, cy, bw, bh = pred_box
 
             if prob > args.th:
                 x1 = int((cx - bw / 2) * W)
@@ -1072,25 +1185,6 @@ def demo(args):
                     2,
                 )
 
-            if args.show_teacher:
-                teacher_obj, teacher_box, _mask = label_from_diff(
-                    diff, threshold=args.diff_th, min_area=args.min_area
-                )
-                if teacher_obj > 0:
-                    tcx, tcy, tbw, tbh = teacher_box
-                    tx1 = int((tcx - tbw / 2) * W)
-                    ty1 = int((tcy - tbh / 2) * H)
-                    tx2 = int((tcx + tbw / 2) * W)
-                    ty2 = int((tcy + tbh / 2) * H)
-                    scale = 4
-                    cv2.rectangle(
-                        frame_show,
-                        (tx1 * scale, ty1 * scale),
-                        (tx2 * scale, ty2 * scale),
-                        (0, 255, 0),
-                        1,
-                    )
-
             cv2.putText(
                 frame_show,
                 f"CfC motion prob: {prob:.2f}",
@@ -1101,6 +1195,14 @@ def demo(args):
                 2,
             )
 
+        if args.record_out:
+            record_frames.append(rgb)
+            record_times.append(now)
+            record_prob.append(prob)
+            record_box.append(pred_box)
+            record_teacher_obj.append(teacher_obj)
+            record_teacher_box.append(teacher_box)
+
         cv2.imshow("CfC moving object detector", frame_show)
 
         key = cv2.waitKey(1) & 0xFF
@@ -1110,6 +1212,24 @@ def demo(args):
 
     cap.release()
     cv2.destroyAllWindows()
+
+    if args.record_out and record_frames:
+        out = Path(args.record_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            out,
+            frames=np.array(record_frames, dtype=np.uint8),
+            times=np.array(record_times, dtype=np.float32),
+            pred_prob=np.array(record_prob, dtype=np.float32),
+            pred_box=np.array(record_box, dtype=np.float32),
+            teacher_obj=np.array(record_teacher_obj, dtype=np.float32),
+            teacher_box=np.array(record_teacher_box, dtype=np.float32),
+            background=np.array(bg, dtype=np.uint8),
+            model=str(args.model),
+            threshold=np.array(args.th, dtype=np.float32),
+        )
+        print(f"Saved feedback recording: {out}")
+        print(f"Frames: {len(record_frames)}")
 
 
 def inspect(args):
@@ -1387,6 +1507,15 @@ def main():
     p.add_argument("--max-frames", type=int, default=0)
     p.set_defaults(func=prepare_video_csv)
 
+    p = sub.add_parser("append-dataset")
+    p.add_argument("--base-data", type=str, required=True)
+    p.add_argument("--base-labels", type=str, required=True)
+    p.add_argument("--add-data", type=str, required=True)
+    p.add_argument("--add-labels", type=str, required=True)
+    p.add_argument("--out-data", type=str, required=True)
+    p.add_argument("--out-labels", type=str, required=True)
+    p.set_defaults(func=append_dataset)
+
     p = sub.add_parser("train")
     p.add_argument("--data", type=str, default="data/webcam_motion.npz")
     p.add_argument("--labels", type=str, default=None)
@@ -1438,6 +1567,7 @@ def main():
     p.add_argument("--diff-th", type=int, default=35)
     p.add_argument("--min-area", type=int, default=40)
     p.add_argument("--live-bg-frames", type=int, default=60)
+    p.add_argument("--record-out", type=str, default=None)
     p.add_argument("--cpu", action="store_true")
     p.set_defaults(func=demo)
 
