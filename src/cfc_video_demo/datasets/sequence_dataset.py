@@ -130,10 +130,10 @@ class CfcSequenceDetectionDataset(Dataset):
 
         x = frames.transpose(0, 3, 1, 2)
         return (
-            torch.tensor(x, dtype=torch.float32),
-            torch.tensor(dt, dtype=torch.float32),
+            torch.from_numpy(x),
+            torch.from_numpy(dt),
             torch.tensor(obj, dtype=torch.float32),
-            torch.tensor(box, dtype=torch.float32),
+            torch.from_numpy(box),
         )
 
     def label_stats(self) -> tuple[int, int, float]:
@@ -153,4 +153,3 @@ def manifest_for_split(data_root: str | Path, split: str) -> Path:
     if not path.exists():
         raise FileNotFoundError(f"Missing split manifest: {path}")
     return path
-

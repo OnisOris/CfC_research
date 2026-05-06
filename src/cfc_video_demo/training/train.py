@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 
 from cfc_video_demo.datasets.sequence_dataset import CfcSequenceDetectionDataset, manifest_for_split
@@ -31,14 +32,51 @@ HISTORY_FIELDS = [
 ]
 
 
-def make_loader(ds: CfcSequenceDetectionDataset, batch_size: int, workers: int, shuffle: bool) -> DataLoader:
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+class SequenceShuffleSampler(Sampler[int]):
+    def __init__(self, ds: CfcSequenceDetectionDataset, seed: int):
+        self.ds = ds
+        self.seed = seed
+        self.epoch = 0
+        self.by_entry: dict[int, list[int]] = {}
+        for sample_idx, (entry_idx, _start) in enumerate(ds.index):
+            self.by_entry.setdefault(entry_idx, []).append(sample_idx)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        entries = list(self.by_entry)
+        rng.shuffle(entries)
+        for entry_idx in entries:
+            sample_indices = self.by_entry[entry_idx].copy()
+            rng.shuffle(sample_indices)
+            yield from sample_indices
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+
+def make_loader(
+    ds: CfcSequenceDetectionDataset,
+    batch_size: int,
+    workers: int,
+    shuffle: bool,
+    seed: int,
+    sequence_shuffle: bool,
+    prefetch_factor: int,
+) -> DataLoader:
+    kwargs = {
+        "batch_size": batch_size,
+        "num_workers": workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = prefetch_factor
+    if shuffle and sequence_shuffle:
+        kwargs["sampler"] = SequenceShuffleSampler(ds, seed)
+    else:
+        kwargs["shuffle"] = shuffle
+    return DataLoader(ds, **kwargs)
 
 
 def train_one_epoch(
@@ -48,25 +86,33 @@ def train_one_epoch(
     device: str,
     box_weight: float,
     pos_weight: float | None,
+    use_amp: bool,
 ) -> dict[str, float]:
     model.train()
     totals = {"loss": 0.0, "obj": 0.0, "box": 0.0}
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     pbar = tqdm(loader, desc="train")
     for x, dt, obj, box in pbar:
-        x, dt, obj, box = x.to(device), dt.to(device), obj.to(device), box.to(device)
-        obj_logit, pred_box = model(x, dt)
-        loss, parts = detection_loss(
-            obj_logit,
-            pred_box,
-            obj,
-            box,
-            box_weight=box_weight,
-            pos_weight=pos_weight,
-        )
-        opt.zero_grad()
-        loss.backward()
+        x = x.to(device, non_blocking=True)
+        dt = dt.to(device, non_blocking=True)
+        obj = obj.to(device, non_blocking=True)
+        box = box.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            obj_logit, pred_box = model(x, dt)
+            loss, parts = detection_loss(
+                obj_logit,
+                pred_box,
+                obj,
+                box,
+                box_weight=box_weight,
+                pos_weight=pos_weight,
+            )
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
 
         for key in totals:
             totals[key] += parts[key]
@@ -77,12 +123,16 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: CnnCfcDetector, loader: DataLoader, device: str, threshold: float) -> dict[str, float]:
+def evaluate(model: CnnCfcDetector, loader: DataLoader, device: str, threshold: float, use_amp: bool) -> dict[str, float]:
     model.eval()
     metrics = DetectionMetrics(threshold)
     for x, dt, obj, box in tqdm(loader, desc="val"):
-        x, dt, obj, box = x.to(device), dt.to(device), obj.to(device), box.to(device)
-        obj_logit, pred_box = model(x, dt)
+        x = x.to(device, non_blocking=True)
+        dt = dt.to(device, non_blocking=True)
+        obj = obj.to(device, non_blocking=True)
+        box = box.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            obj_logit, pred_box = model(x, dt)
         metrics.update(obj_logit, pred_box, obj, box)
     return metrics.compute()
 
@@ -143,9 +193,26 @@ def train(args) -> None:
     print(f"Train positive windows: {positives}/{total} ({pos_ratio:.1%})")
     print(f"BCE pos_weight: {pos_weight:.3f}")
 
-    train_loader = make_loader(train_ds, args.batch, args.workers, shuffle=True)
-    val_loader = make_loader(val_ds, args.batch, args.workers, shuffle=False)
+    train_loader = make_loader(
+        train_ds,
+        args.batch,
+        args.workers,
+        shuffle=True,
+        seed=args.seed,
+        sequence_shuffle=args.sequence_shuffle,
+        prefetch_factor=args.prefetch_factor,
+    )
+    val_loader = make_loader(
+        val_ds,
+        args.batch,
+        args.workers,
+        shuffle=False,
+        seed=args.seed,
+        sequence_shuffle=False,
+        prefetch_factor=args.prefetch_factor,
+    )
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    use_amp = args.amp and device == "cuda"
     model = CnnCfcDetector(args.image_size, args.feat_dim, args.hidden).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history_path = Path(args.history) if args.history else default_history_path(args.model)
@@ -157,8 +224,8 @@ def train(args) -> None:
     best_f1 = -1.0
     best_metrics: dict[str, float] = {}
     for epoch in range(1, args.epochs + 1):
-        losses = train_one_epoch(model, train_loader, opt, device, args.box_weight, pos_weight)
-        metrics = evaluate(model, val_loader, device, args.th)
+        losses = train_one_epoch(model, train_loader, opt, device, args.box_weight, pos_weight, use_amp)
+        metrics = evaluate(model, val_loader, device, args.th, use_amp)
         print(
             f"epoch={epoch} loss={losses['loss']:.4f} obj={losses['obj']:.4f} box={losses['box']:.4f} "
             f"precision={metrics['precision']:.3f} recall={metrics['recall']:.3f} "
@@ -228,10 +295,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feat-dim", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--th", type=float, default=0.5)
     parser.add_argument("--max-train-windows", type=int, default=0)
     parser.add_argument("--max-val-windows", type=int, default=0)
     parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument("--sequence-shuffle", action="store_true")
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=1337)
     return parser

@@ -296,11 +296,12 @@ def build_npz_payload(
     }
 
 
-def write_sequence(seq: RawSequence, split: str, out_root: Path, payload: dict, stats: SequenceStats) -> dict:
+def write_sequence(seq: RawSequence, split: str, out_root: Path, payload: dict, stats: SequenceStats, compress: bool) -> dict:
     split_dir = out_root / split
     split_dir.mkdir(parents=True, exist_ok=True)
     out_path = split_dir / f"{seq.name}.npz"
-    np.savez_compressed(out_path, **payload)
+    save = np.savez_compressed if compress else np.savez
+    save(out_path, **payload)
     return {
         "path": str(out_path.relative_to(out_root)),
         "sequence": seq.name,
@@ -362,7 +363,7 @@ def convert(args) -> None:
                 payload, stats = convert_preextracted_sequence(seq, args)
             else:
                 payload, stats = convert_seq_vbb_sequence(seq, args)
-            row = write_sequence(seq, split, out_root, payload, stats)
+            row = write_sequence(seq, split, out_root, payload, stats, compress=not args.no_compress)
             split_rows[split].append(row)
             split_stats[split].merge(stats)
 
@@ -383,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-sequences", type=int, default=0)
     parser.add_argument("--min-box-height", type=float, default=10.0)
     parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--no-compress", action="store_true")
     parser.add_argument("--extract-tars", action="store_true")
     return parser
 

@@ -11,6 +11,7 @@ class CnnCfcDetector(nn.Module):
         self.image_size = image_size
         self.feat_dim = feat_dim
         self.hidden = hidden
+        self._coord_cache: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
         self.encoder = nn.Sequential(
             nn.Conv2d(5, 32, 5, stride=2, padding=2),
@@ -42,12 +43,17 @@ class CnnCfcDetector(nn.Module):
 
     def add_coord_channels(self, x: torch.Tensor) -> torch.Tensor:
         b, _c, h, w = x.shape
-        yy, xx = torch.meshgrid(
-            torch.linspace(-1, 1, h, device=x.device, dtype=x.dtype),
-            torch.linspace(-1, 1, w, device=x.device, dtype=x.dtype),
-            indexing="ij",
-        )
-        coords = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(b, -1, -1, -1)
+        key = (x.device, x.dtype, h, w)
+        coords = self._coord_cache.get(key)
+        if coords is None:
+            yy, xx = torch.meshgrid(
+                torch.linspace(-1, 1, h, device=x.device, dtype=x.dtype),
+                torch.linspace(-1, 1, w, device=x.device, dtype=x.dtype),
+                indexing="ij",
+            )
+            coords = torch.stack([xx, yy], dim=0).unsqueeze(0)
+            self._coord_cache[key] = coords
+        coords = coords.expand(b, -1, -1, -1)
         return torch.cat([x, coords], dim=1)
 
     def forward(self, x: torch.Tensor, dt: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -71,4 +77,3 @@ class CnnCfcDetector(nn.Module):
         obj_logit = out[:, 0]
         box = torch.sigmoid(out[:, 1:5])
         return obj_logit, box
-
