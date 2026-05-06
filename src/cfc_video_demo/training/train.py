@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 
 import torch
@@ -13,6 +15,20 @@ from cfc_video_demo.training.losses import detection_loss
 from cfc_video_demo.training.metrics import DetectionMetrics
 from cfc_video_demo.utils.checkpoint import save_checkpoint
 from cfc_video_demo.utils.seed import seed_everything
+
+
+HISTORY_FIELDS = [
+    "epoch",
+    "train_loss",
+    "train_obj_loss",
+    "train_box_loss",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_mean_iou",
+    "val_recall_at_iou_0_5",
+    "best",
+]
 
 
 def make_loader(ds: CfcSequenceDetectionDataset, batch_size: int, workers: int, shuffle: bool) -> DataLoader:
@@ -71,6 +87,32 @@ def evaluate(model: CnnCfcDetector, loader: DataLoader, device: str, threshold: 
     return metrics.compute()
 
 
+def default_history_path(model_path: str | Path) -> Path:
+    path = Path(model_path)
+    return path.with_name(f"{path.stem}_history.csv")
+
+
+def jsonl_history_path(csv_path: str | Path) -> Path:
+    path = Path(csv_path)
+    return path.with_suffix(".jsonl")
+
+
+def reset_history_files(csv_path: Path) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+    jsonl_history_path(csv_path).write_text("")
+
+
+def append_history_row(csv_path: Path, row: dict[str, float | int | bool]) -> None:
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+        writer.writerow(row)
+    with jsonl_history_path(csv_path).open("a") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
 def train(args) -> None:
     seed_everything(args.seed)
     data_root = Path(args.data)
@@ -106,6 +148,10 @@ def train(args) -> None:
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     model = CnnCfcDetector(args.image_size, args.feat_dim, args.hidden).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    history_path = Path(args.history) if args.history else default_history_path(args.model)
+    reset_history_files(history_path)
+    print(f"History CSV: {history_path}")
+    print(f"History JSONL: {jsonl_history_path(history_path)}")
 
     best_score = -1.0
     best_f1 = -1.0
@@ -121,10 +167,12 @@ def train(args) -> None:
         )
 
         score = metrics["recall_at_iou_0_5"]
+        is_best = False
         if score > best_score or (score == best_score and metrics["f1"] >= best_f1):
             best_score = score
             best_f1 = metrics["f1"]
             best_metrics = metrics
+            is_best = True
             save_checkpoint(
                 args.model,
                 {
@@ -144,6 +192,22 @@ def train(args) -> None:
             )
             print(f"Saved best checkpoint: {args.model}")
 
+        append_history_row(
+            history_path,
+            {
+                "epoch": epoch,
+                "train_loss": losses["loss"],
+                "train_obj_loss": losses["obj"],
+                "train_box_loss": losses["box"],
+                "val_precision": metrics["precision"],
+                "val_recall": metrics["recall"],
+                "val_f1": metrics["f1"],
+                "val_mean_iou": metrics["mean_iou"],
+                "val_recall_at_iou_0_5": metrics["recall_at_iou_0_5"],
+                "best": is_best,
+            },
+        )
+
     print(f"Best metrics: {best_metrics}")
 
 
@@ -151,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train CNN encoder + CfC single-target pedestrian detector.")
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--history", type=str, default=None)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=4)

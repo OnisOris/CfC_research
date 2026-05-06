@@ -1,33 +1,34 @@
 # CfC research
 
-Small research demo for pedestrian localization in video with Closed-form
-Continuous-time networks.
+Исследовательский пример для локализации пешехода на видео с помощью
+Closed-form Continuous-time networks (CfC).
 
-This is not YOLO. The model in this repository is:
+Модель обрабатывает короткое окно кадров и предсказывает наличие пешехода и
+ограничивающую рамку для последнего кадра окна:
 
 ```text
-RGB frame sequence -> CNN encoder per frame -> CfC over time -> detection head
+последовательность RGB-кадров -> CNN-энкодер для каждого кадра -> CfC по времени -> detection head
 ```
 
-The detector predicts one target for the last frame of each sequence:
+На текущем этапе это одноцелевой детектор. Для каждого окна он предсказывает:
 
-- `objectness`: whether a person is present
-- `bbox`: normalized `cx cy w h`
+- `objectness`: есть ли пешеход в последнем кадре;
+- `bbox`: нормализованную рамку в формате `cx cy w h`.
 
-For the first Caltech demo this is intentionally a single-target detector, not
-a full multi-object detector. If a frame has multiple people, conversion uses
-either the largest person box or the union of all person boxes.
+Если в кадре несколько пешеходов, при конвертации данных используется один
+целевой бокс: либо самый крупный бокс пешехода, либо объединение всех боксов.
+Режим выбирается параметром `--target-mode`.
 
-## Caltech Pedestrian Pipeline
+## Pipeline для Caltech Pedestrians
 
-The primary dataset target is Caltech Pedestrians:
+Основной датасет для примера — Caltech Pedestrians:
 https://data.caltech.edu/records/f6rph-90m20
 
-The dbcollection dataset page is useful for understanding the available
-Caltech detection tasks and the original annotations:
+Описание оригинальных задач и аннотаций Caltech также есть в документации
+dbcollection:
 https://dbcollection.readthedocs.io/en/latest/datasets/caltech_ped.html
 
-### Download
+### Скачивание
 
 ```bash
 mkdir -p data/caltech_pedestrians
@@ -37,17 +38,17 @@ curl -L -C - \
   "https://data.caltech.edu/records/f6rph-90m20/files/data_and_labels.zip?download=1"
 ```
 
-### Unzip
+### Распаковка
 
 ```bash
 unzip data/caltech_pedestrians/data_and_labels.zip -d data/caltech_pedestrians/raw
 ```
 
-If the unzip creates `setXX.tar` files instead of extracted `setXX/*.seq`
-directories, either unpack those tars manually or pass `--extract-tars` to the
-converter.
+Если после распаковки внутри лежат `setXX.tar`, а не директории
+`setXX/*.seq`, можно распаковать tar-файлы вручную или передать конвертеру
+флаг `--extract-tars`.
 
-### Convert
+### Конвертация
 
 ```bash
 uv run cfc-caltech-convert \
@@ -58,7 +59,7 @@ uv run cfc-caltech-convert \
   --target-mode largest
 ```
 
-Prepared data is written as one `.npz` per source video:
+После конвертации данные сохраняются по одному `.npz` файлу на исходное видео:
 
 ```text
 data/caltech_prepared/
@@ -71,10 +72,10 @@ data/caltech_prepared/
   manifest_test.jsonl
 ```
 
-Each `.npz` contains resized RGB frames, frame times, objectness labels, and a
-single normalized target box for each frame.
+Каждый `.npz` содержит уменьшенные RGB-кадры, временные метки, objectness-метки
+и один нормализованный целевой бокс для каждого кадра.
 
-### Train
+### Обучение
 
 ```bash
 uv run cfc-caltech-train \
@@ -86,10 +87,16 @@ uv run cfc-caltech-train \
   --batch 32
 ```
 
-`seq_len` defaults to `16`; use at least `8` for meaningful temporal CfC
-experiments.
+Параметр `--seq-len` задает длину временного окна. По умолчанию используется
+`16`; для быстрых проверок можно уменьшить до `8`.
 
-### Eval
+Параметр `--stride` задает шаг между соседними окнами. Чем меньше шаг, тем
+больше обучающих примеров и тем дольше обучение.
+
+Если PyTorch видит CUDA и не передан флаг `--cpu`, обучение автоматически
+запускается на GPU.
+
+### Оценка
 
 ```bash
 uv run cfc-caltech-eval \
@@ -98,10 +105,10 @@ uv run cfc-caltech-eval \
   --split val
 ```
 
-The first demo reports precision, recall, F1, mean IoU on positive frames, and
-recall at IoU 0.5. It does not compute mAP.
+Скрипт выводит precision, recall, F1, mean IoU на положительных кадрах и
+recall при IoU 0.5. mAP в этом примере не считается.
 
-### Predict
+### Предсказание на видео
 
 ```bash
 uv run cfc-caltech-predict \
@@ -110,11 +117,11 @@ uv run cfc-caltech-predict \
   --out outputs/cfc_caltech_demo.mp4
 ```
 
-The visualization draws predicted boxes in red and ground-truth boxes in green.
+Визуализация рисует предсказанные рамки красным цветом, а разметку — зеленым.
 
-## Smoke Test
+## Быстрая проверка
 
-After a small part of the dataset is available, use:
+Для проверки пайплайна на небольшой части данных:
 
 ```bash
 uv run cfc-caltech-convert \
