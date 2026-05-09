@@ -11,6 +11,7 @@ dependencies = [
     "scipy",
     "torch",
     "tqdm",
+    "ultralytics",
 ]
 
 [project.scripts]
@@ -18,6 +19,10 @@ cfc-caltech-convert = "cfc_video_demo.cli:caltech_convert_main"
 cfc-caltech-train = "cfc_video_demo.cli:caltech_train_main"
 cfc-caltech-eval = "cfc_video_demo.cli:caltech_eval_main"
 cfc-caltech-predict = "cfc_video_demo.cli:caltech_predict_main"
+cfc-yolo-cache = "cfc_video_demo.cli:yolo_cache_main"
+cfc-yolo-train = "cfc_video_demo.cli:yolo_train_main"
+cfc-yolo-eval = "cfc_video_demo.cli:yolo_eval_main"
+cfc-yolo-webcam = "cfc_video_demo.cli:yolo_webcam_main"
 
 [build-system]
 requires = ["hatchling"]

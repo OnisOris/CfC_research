@@ -3,18 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import random
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from cfc_video_demo.datasets.sequence_dataset import CfcSequenceDetectionDataset, manifest_for_split
-from cfc_video_demo.models.cnn_cfc_detector import CnnCfcDetector
+from cfc_video_demo.datasets.sequence_dataset import CfcYoloFeatureDataset, manifest_for_split
+from cfc_video_demo.models.cnn_cfc_detector import YoloCfcRefiner
 from cfc_video_demo.training.losses import detection_loss
 from cfc_video_demo.training.metrics import DetectionMetrics
-from cfc_video_demo.utils.checkpoint import save_checkpoint
+from cfc_video_demo.utils.checkpoint import load_checkpoint, save_checkpoint
 from cfc_video_demo.utils.seed import seed_everything
 
 
@@ -24,76 +23,48 @@ HISTORY_FIELDS = [
     "train_obj_loss",
     "train_box_loss",
     "train_iou_loss",
-    "train_heatmap_loss",
     "val_precision",
     "val_recall",
     "val_f1",
     "val_mean_iou",
     "val_recall_at_iou_0_5",
+    "base_precision",
+    "base_recall",
+    "base_f1",
+    "base_mean_iou",
+    "base_recall_at_iou_0_5",
     "best",
 ]
 
 
-class SequenceShuffleSampler(Sampler[int]):
-    def __init__(self, ds: CfcSequenceDetectionDataset, seed: int):
-        self.ds = ds
-        self.seed = seed
-        self.epoch = 0
-        self.by_entry: dict[int, list[int]] = {}
-        for sample_idx, (entry_idx, _start) in enumerate(ds.index):
-            self.by_entry.setdefault(entry_idx, []).append(sample_idx)
-
-    def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        self.epoch += 1
-        entries = list(self.by_entry)
-        rng.shuffle(entries)
-        for entry_idx in entries:
-            sample_indices = self.by_entry[entry_idx].copy()
-            rng.shuffle(sample_indices)
-            yield from sample_indices
-
-    def __len__(self) -> int:
-        return len(self.ds)
-
-
-def make_loader(
-    ds: CfcSequenceDetectionDataset,
-    batch_size: int,
-    workers: int,
-    shuffle: bool,
-    seed: int,
-    sequence_shuffle: bool,
-    prefetch_factor: int,
-) -> DataLoader:
+def make_loader(ds: CfcYoloFeatureDataset, batch_size: int, workers: int, shuffle: bool) -> DataLoader:
     kwargs = {
         "batch_size": batch_size,
+        "shuffle": shuffle,
         "num_workers": workers,
         "pin_memory": torch.cuda.is_available(),
     }
     if workers > 0:
         kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = prefetch_factor
-    if shuffle and sequence_shuffle:
-        kwargs["sampler"] = SequenceShuffleSampler(ds, seed)
-    else:
-        kwargs["shuffle"] = shuffle
     return DataLoader(ds, **kwargs)
 
 
+def yolo_conf_logit(conf: torch.Tensor) -> torch.Tensor:
+    return torch.logit(conf.clamp(1e-4, 1.0 - 1e-4))
+
+
 def train_one_epoch(
-    model: CnnCfcDetector,
+    model: YoloCfcRefiner,
     loader: DataLoader,
     opt: torch.optim.Optimizer,
     device: str,
     box_weight: float,
     iou_weight: float,
-    heatmap_weight: float,
     pos_weight: float | None,
     use_amp: bool,
 ) -> dict[str, float]:
     model.train()
-    totals = {"loss": 0.0, "obj": 0.0, "box": 0.0, "iou": 0.0, "heatmap": 0.0}
+    totals = {"loss": 0.0, "obj": 0.0, "box": 0.0, "iou": 0.0}
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     pbar = tqdm(loader, desc="train")
     for x, dt, obj, box in pbar:
@@ -102,7 +73,7 @@ def train_one_epoch(
         obj = obj.to(device, non_blocking=True)
         box = box.to(device, non_blocking=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
-            obj_logit, pred_box, aux = model(x, dt, return_aux=True)
+            obj_logit, pred_box = model(x, dt)
             loss, parts = detection_loss(
                 obj_logit,
                 pred_box,
@@ -110,10 +81,6 @@ def train_one_epoch(
                 box,
                 box_weight=box_weight,
                 iou_weight=iou_weight,
-                heatmap_logits=aux["heatmap_logits"],
-                heatmap_weight=heatmap_weight,
-                cell_boxes=aux["cell_boxes"],
-                grid_size=aux["grid_size"],
                 pos_weight=pos_weight,
             )
         opt.zero_grad(set_to_none=True)
@@ -130,7 +97,6 @@ def train_one_epoch(
             obj=f"{parts['obj']:.4f}",
             box=f"{parts['box']:.4f}",
             iou=f"{parts['iou']:.4f}",
-            hm=f"{parts['heatmap']:.4f}",
         )
 
     n = max(1, len(loader))
@@ -138,9 +104,16 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: CnnCfcDetector, loader: DataLoader, device: str, threshold: float, use_amp: bool) -> dict[str, float]:
+def evaluate(
+    model: YoloCfcRefiner,
+    loader: DataLoader,
+    device: str,
+    threshold: float,
+    use_amp: bool,
+) -> tuple[dict[str, float], dict[str, float]]:
     model.eval()
     metrics = DetectionMetrics(threshold)
+    baseline = DetectionMetrics(threshold)
     for x, dt, obj, box in tqdm(loader, desc="val"):
         x = x.to(device, non_blocking=True)
         dt = dt.to(device, non_blocking=True)
@@ -149,7 +122,8 @@ def evaluate(model: CnnCfcDetector, loader: DataLoader, device: str, threshold: 
         with torch.amp.autocast("cuda", enabled=use_amp):
             obj_logit, pred_box = model(x, dt)
         metrics.update(obj_logit, pred_box, obj, box)
-    return metrics.compute()
+        baseline.update(yolo_conf_logit(x[:, -1, 0]), x[:, -1, 1:5], obj, box)
+    return metrics.compute(), baseline.compute()
 
 
 def default_history_path(model_path: str | Path) -> Path:
@@ -178,24 +152,28 @@ def append_history_row(csv_path: Path, row: dict[str, float | int | bool]) -> No
         f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def train(args) -> None:
-    seed_everything(args.seed)
+def build_datasets(args) -> tuple[CfcYoloFeatureDataset, CfcYoloFeatureDataset]:
     data_root = Path(args.data)
-    train_ds = CfcSequenceDetectionDataset(
+    train_ds = CfcYoloFeatureDataset(
         manifest_for_split(data_root, "train"),
         seq_len=args.seq_len,
         stride=args.stride,
         augment=not args.no_augment,
         max_windows=args.max_train_windows,
     )
-    val_ds = CfcSequenceDetectionDataset(
+    val_ds = CfcYoloFeatureDataset(
         manifest_for_split(data_root, "val"),
         seq_len=args.seq_len,
         stride=args.stride,
         augment=False,
         max_windows=args.max_val_windows,
     )
+    return train_ds, val_ds
 
+
+def train(args) -> None:
+    seed_everything(args.seed)
+    train_ds, val_ds = build_datasets(args)
     positives, total, pos_ratio = train_ds.label_stats()
     if args.pos_weight > 0:
         pos_weight = args.pos_weight
@@ -208,27 +186,11 @@ def train(args) -> None:
     print(f"Train positive windows: {positives}/{total} ({pos_ratio:.1%})")
     print(f"BCE pos_weight: {pos_weight:.3f}")
 
-    train_loader = make_loader(
-        train_ds,
-        args.batch,
-        args.workers,
-        shuffle=True,
-        seed=args.seed,
-        sequence_shuffle=args.sequence_shuffle,
-        prefetch_factor=args.prefetch_factor,
-    )
-    val_loader = make_loader(
-        val_ds,
-        args.batch,
-        args.workers,
-        shuffle=False,
-        seed=args.seed,
-        sequence_shuffle=False,
-        prefetch_factor=args.prefetch_factor,
-    )
+    train_loader = make_loader(train_ds, args.batch, args.workers, shuffle=True)
+    val_loader = make_loader(val_ds, args.batch, args.workers, shuffle=False)
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     use_amp = args.amp and device == "cuda"
-    model = CnnCfcDetector(args.image_size, args.feat_dim, args.hidden, args.spatial_pool).to(device)
+    model = YoloCfcRefiner(input_size=5, hidden=args.hidden, direct_weight=args.direct_weight).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history_path = Path(args.history) if args.history else default_history_path(args.model)
     reset_history_files(history_path)
@@ -246,16 +208,16 @@ def train(args) -> None:
             device,
             args.box_weight,
             args.iou_weight,
-            args.heatmap_weight,
             pos_weight,
             use_amp,
         )
-        metrics = evaluate(model, val_loader, device, args.th, use_amp)
+        metrics, baseline = evaluate(model, val_loader, device, args.th, use_amp)
         print(
             f"epoch={epoch} loss={losses['loss']:.4f} obj={losses['obj']:.4f} box={losses['box']:.4f} "
             f"precision={metrics['precision']:.3f} recall={metrics['recall']:.3f} "
             f"f1={metrics['f1']:.3f} mean_iou={metrics['mean_iou']:.3f} "
-            f"recall_at_iou_0_5={metrics['recall_at_iou_0_5']:.3f}"
+            f"recall_at_iou_0_5={metrics['recall_at_iou_0_5']:.3f} "
+            f"base_f1={baseline['f1']:.3f} base_mean_iou={baseline['mean_iou']:.3f}"
         )
 
         score = metrics["recall_at_iou_0_5"]
@@ -270,17 +232,17 @@ def train(args) -> None:
                 {
                     "model": model.state_dict(),
                     "config": {
-                        "image_size": args.image_size,
                         "seq_len": args.seq_len,
                         "stride": args.stride,
-                        "feat_dim": args.feat_dim,
                         "hidden": args.hidden,
-                        "spatial_pool": args.spatial_pool,
-                        "arch": "cnn-cfc-yolo-cell-detector-v4",
+                        "direct_weight": args.direct_weight,
+                        "arch": "yolo-cfc-refiner-v1",
                     },
                     "epoch": epoch,
                     "metrics": metrics,
+                    "baseline_metrics": baseline,
                     "label_format": "single target objectness + normalized cx cy w h",
+                    "feature_format": "conf cx cy w h",
                 },
             )
             print(f"Saved best checkpoint: {args.model}")
@@ -293,12 +255,16 @@ def train(args) -> None:
                 "train_obj_loss": losses["obj"],
                 "train_box_loss": losses["box"],
                 "train_iou_loss": losses["iou"],
-                "train_heatmap_loss": losses["heatmap"],
                 "val_precision": metrics["precision"],
                 "val_recall": metrics["recall"],
                 "val_f1": metrics["f1"],
                 "val_mean_iou": metrics["mean_iou"],
                 "val_recall_at_iou_0_5": metrics["recall_at_iou_0_5"],
+                "base_precision": baseline["precision"],
+                "base_recall": baseline["recall"],
+                "base_f1": baseline["f1"],
+                "base_mean_iou": baseline["mean_iou"],
+                "base_recall_at_iou_0_5": baseline["recall_at_iou_0_5"],
                 "best": is_best,
             },
         )
@@ -306,47 +272,93 @@ def train(args) -> None:
     print(f"Best metrics: {best_metrics}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train CNN encoder + CfC single-target pedestrian detector.")
+@torch.no_grad()
+def run_eval(args) -> tuple[dict[str, float], dict[str, float]]:
+    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    ckpt = load_checkpoint(args.model, device)
+    config = ckpt["config"]
+    seq_len = args.seq_len if args.seq_len > 0 else int(config["seq_len"])
+    stride = args.stride if args.stride > 0 else int(config.get("stride", 4))
+    ds = CfcYoloFeatureDataset(
+        manifest_for_split(Path(args.data), args.split),
+        seq_len=seq_len,
+        stride=stride,
+        augment=False,
+        max_windows=args.max_windows,
+    )
+    loader = make_loader(ds, args.batch, args.workers, shuffle=False)
+    model = YoloCfcRefiner(
+        input_size=5,
+        hidden=int(config.get("hidden", 96)),
+        direct_weight=float(config.get("direct_weight", 0.25)),
+    ).to(device)
+    model.load_state_dict(ckpt["model"])
+    use_amp = args.amp and device == "cuda"
+    return evaluate(model, loader, device, args.th, use_amp)
+
+
+def build_train_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train CfC temporal refiner on cached YOLO person detections.")
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--history", type=str, default=None)
-    parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--box-weight", type=float, default=10.0)
-    parser.add_argument("--iou-weight", type=float, default=0.0)
-    parser.add_argument("--heatmap-weight", type=float, default=1.0)
+    parser.add_argument("--box-weight", type=float, default=20.0)
+    parser.add_argument("--iou-weight", type=float, default=1.0)
     parser.add_argument("--pos-weight", type=float, default=0.0)
-    parser.add_argument("--feat-dim", type=int, default=128)
-    parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--spatial-pool", type=int, default=4)
+    parser.add_argument("--hidden", type=int, default=96)
+    parser.add_argument("--direct-weight", type=float, default=0.25)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--th", type=float, default=0.5)
     parser.add_argument("--max-train-windows", type=int, default=0)
     parser.add_argument("--max-val-windows", type=int, default=0)
     parser.add_argument("--no-augment", action="store_true")
-    parser.add_argument("--sequence-shuffle", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=1337)
     return parser
 
 
-def main() -> None:
-    parser = build_parser()
+def build_eval_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Evaluate a YOLO+CfC temporal refiner checkpoint.")
+    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--split", type=str, default="val", choices=("train", "val", "test"))
+    parser.add_argument("--th", type=float, default=0.5)
+    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=0)
+    parser.add_argument("--stride", type=int, default=0)
+    parser.add_argument("--max-windows", type=int, default=0)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--cpu", action="store_true")
+    return parser
+
+
+def train_main() -> None:
+    parser = build_train_parser()
     args = parser.parse_args()
     if args.seq_len < 2:
         raise ValueError("--seq-len must be >= 2")
-    if args.spatial_pool < 1:
-        raise ValueError("--spatial-pool must be >= 1")
     train(args)
 
 
+def eval_main() -> None:
+    parser = build_eval_parser()
+    args = parser.parse_args()
+    metrics, baseline = run_eval(args)
+    print("refined:")
+    for key in ("precision", "recall", "f1", "mean_iou", "recall_at_iou_0_5"):
+        print(f"{key}: {metrics[key]:.4f}")
+    print("baseline_yolo:")
+    for key in ("precision", "recall", "f1", "mean_iou", "recall_at_iou_0_5"):
+        print(f"{key}: {baseline[key]:.4f}")
+
+
 if __name__ == "__main__":
-    main()
+    train_main()

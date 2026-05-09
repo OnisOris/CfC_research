@@ -34,6 +34,7 @@ def predict_sequence(args) -> None:
         image_size=int(config.get("image_size", 128)),
         feat_dim=int(config.get("feat_dim", 128)),
         hidden=int(config.get("hidden", 128)),
+        spatial_pool=int(config.get("spatial_pool", 4)),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -110,4 +111,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
